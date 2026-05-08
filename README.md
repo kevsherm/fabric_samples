@@ -16,7 +16,7 @@ This repo serves as a growing library of reusable tools and samples built around
 | Folder | Description |
 |---|---|
 | `/Operations` | general items to help with understanding of Fabric Operations |
-
+| `/Project-Management` | items related to Project Management Activities - ADO Analtics, etc |
 
 > 📝 This structure will grow over time as new samples are added.
 
