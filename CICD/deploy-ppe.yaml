@@ -1,0 +1,159 @@
+# =============================================================================
+# deploy-ppe.yaml
+#
+# Azure DevOps pipeline: deploys ALL Fabric items to the UAT/PPE workspace.
+#
+# Trigger: any push to the 'ppe' branch that touches files under the
+#          path defined in the RepoDir variable will kick off this pipeline.
+#
+# Variable group required: vg_fabric_cicd
+#   Create this group in Azure DevOps under:
+#   Pipelines > Library > Variable Groups
+#
+#   Required variables/secrets:
+#     FABRIC_TENANT_ID          - Azure AD tenant ID for the service principal
+#     FABRIC_CLIENT_ID          - Service principal (app registration) client ID
+#     FABRIC_CLIENT_SECRET      - Service principal client secret (mark as secret)
+#     PPE_WORKSPACE_ID          - GUID of the target PPE/UAT Fabric workspace
+#     PPE_WORKSPACE_NAME        - Display name of the PPE/UAT Fabric workspace
+# =============================================================================
+name: 'deploy-ppe_$(Date:yyyyMMdd)$(Rev:.r)'
+
+# ---------------------------------------------------------------------------
+# CI trigger
+# Runs automatically when the 'ppe' branch receives a push that includes
+# changes inside the folder defined by RepoDir below.
+# ---------------------------------------------------------------------------
+trigger:
+  branches:
+    include:
+      - ppe
+  paths:
+    include:
+      - fabric/workspace/**   # UPDATE: set this to the folder containing your Fabric items
+
+# ---------------------------------------------------------------------------
+# Variables
+# Pulls secrets from the shared variable group and defines convenience paths
+# used throughout the pipeline steps below.
+# Update RepoDir to match the folder in your repository that contains
+# your Fabric item directories (e.g. MyNotebook.Notebook).
+# ---------------------------------------------------------------------------
+variables:
+  - group: vg_fabric_cicd
+  - name: RepoDir
+    # UPDATE: set this to the path containing your Fabric item folders
+    value: '$(Build.SourcesDirectory)/fabric/workspace/'
+  - name: ArtifactDir
+    # Staging folder for output files before they are published as artifacts
+    value: '$(Pipeline.Workspace)/deployed'
+  - name: OutputJsonPath
+    # Full path for the machine-readable deployment record
+    value: '$(Pipeline.Workspace)/deployed/deployed-items.json'
+
+pool:
+  vmImage: 'windows-latest'
+
+stages:
+  - stage: PPE_Deployment
+    displayName: 'PPE Deployment'
+    jobs:
+      - job: Publish
+        displayName: 'Publish all items to PPE'
+        steps:
+
+          # -------------------------------------------------------------------
+          # Step 1 — Checkout
+          # Full history (fetchDepth: 0) ensures the full git tree is available.
+          # persistCredentials allows subsequent git operations within the job.
+          # -------------------------------------------------------------------
+          - checkout: self
+            clean: true
+            fetchDepth: 0
+            persistCredentials: true
+
+          # -------------------------------------------------------------------
+          # Step 2 — Python setup
+          # Pins the Python version used for the deployment script.
+          # -------------------------------------------------------------------
+          - task: UsePythonVersion@0
+            displayName: 'Use Python 3.12'
+            inputs:
+              versionSpec: '3.12'
+              addToPath: true
+
+          # -------------------------------------------------------------------
+          # Step 3 — pip cache
+          # Caches downloaded packages between pipeline runs to speed up
+          # installs. Cache key includes OS and Python version so different
+          # agent configurations don't share incompatible caches.
+          # -------------------------------------------------------------------
+          - task: Cache@2
+            displayName: 'Cache pip packages'
+            inputs:
+              key: 'pip | "$(Agent.OS)" | "3.12"'
+              restoreKeys: 'pip | "$(Agent.OS)"'
+              path: '$(Pipeline.Workspace)/.pip-cache'
+
+          # -------------------------------------------------------------------
+          # Step 4 — Install dependencies
+          # Installs the two libraries the deploy script needs:
+          #   fabric-cicd    - Microsoft library for deploying Fabric items
+          #   azure-identity - Provides DefaultAzureCredential for auth
+          # -------------------------------------------------------------------
+          - pwsh: |
+              python -m pip config set global.cache-dir "$(Pipeline.Workspace)/.pip-cache" 2>$null
+              python -m pip install --upgrade pip
+              pip install fabric-cicd azure-identity
+            displayName: 'Install dependencies'
+
+          # -------------------------------------------------------------------
+          # Step 5 — Deploy
+          # Calls publish_to_fabric.py which:
+          #   1. Connects to the PPE workspace using the service principal
+          #      credentials passed via env vars below
+          #   2. Publishes every Fabric item found in RepoDir
+          #   3. Removes items from the workspace that no longer exist in the repo
+          #   4. Writes deployed-items.json and summary.md to ArtifactDir
+          #
+          # The three AZURE_* env vars are picked up automatically by
+          # DefaultAzureCredential inside the script (EnvironmentCredential).
+          # UPDATE: set scriptPath to the location of publish_to_fabric.py in your repo
+          # -------------------------------------------------------------------
+          - task: PythonScript@0
+            displayName: 'Publish all Fabric items'
+            inputs:
+              scriptPath: '$(Build.SourcesDirectory)/.scripts/publish_to_fabric.py'
+              arguments: '--WorkspaceId "$(PPE_WORKSPACE_ID)" --WorkspaceName "$(PPE_WORKSPACE_NAME)" --Environment "PPE" --RepositoryDirectory "$(RepoDir)" --OutputJsonPath "$(OutputJsonPath)" --SkipUnpublish "false"'
+            env:
+              AZURE_TENANT_ID:     $(FABRIC_TENANT_ID)
+              AZURE_CLIENT_ID:     $(FABRIC_CLIENT_ID)
+              AZURE_CLIENT_SECRET: $(FABRIC_CLIENT_SECRET)
+
+          # -------------------------------------------------------------------
+          # Step 6 — Surface summary in ADO
+          # Uploads summary.md so it appears as a formatted tab on the
+          # pipeline run page in Azure DevOps (Extensions > Summary).
+          # -------------------------------------------------------------------
+          - pwsh: |
+              $md = "$(ArtifactDir)/summary.md"
+              if (Test-Path $md) {
+                Write-Host "##vso[task.uploadsummary]$md"
+              } else {
+                Write-Host "No summary.md found — skipping."
+              }
+            displayName: 'Publish deployment summary to pipeline'
+
+          # -------------------------------------------------------------------
+          # Step 7 — Publish artifacts
+          # Saves deployed-items.json and summary.md as a downloadable pipeline
+          # artifact. condition: always() ensures this runs even if an earlier
+          # step fails, so partial results are still available for debugging.
+          # -------------------------------------------------------------------
+          - task: PublishPipelineArtifact@1
+            displayName: 'Upload deployment artifacts'
+            condition: always()
+            inputs:
+              targetPath:      '$(ArtifactDir)'
+              artifact:        'deployed-items-ppe'
+              publishLocation: 'pipeline'
